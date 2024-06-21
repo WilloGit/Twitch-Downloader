@@ -13,6 +13,7 @@ class TwitchDownloader:
         self.end_time_entry = None
         self.clip_id_entry = None
         self.render_chat_button = None
+        self.bulk_download_clips_button = None
         self.output_text = None
         self.progress_bar = None
 
@@ -158,6 +159,14 @@ class TwitchDownloader:
 
         thread = threading.Thread(target=render_task)
         thread.start()
+
+    def bulk_download_clips(self, clip_links):
+        for link in clip_links:
+            # Extract clip ID from the link
+            clip_id = self.extract_clip_id(link)
+            # Download and render each clip
+            self.download_clip(clip_id)
+            self.render_with_chat(clip_id)
 
     def run_command(self, command, description):
         self.progress_bar.start()
