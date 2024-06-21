@@ -1,0 +1,2 @@
+ttkbootstrap==1.10.1
+python-vlc==3.0.20123
