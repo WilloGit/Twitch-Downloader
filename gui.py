@@ -2,16 +2,27 @@ import tkinter as tk
 import requests
 from tkinter import ttk
 import bs4
+from tkinter import filedialog
 from bs4 import BeautifulSoup
+import threading
 import twitchtools
 from PIL import Image, ImageTk
 from io import BytesIO
-
+from datetime import datetime
+from tkinter import messagebox
 
 
 class ScrollableClipFrame(ttk.Frame):
     def __init__(self, parent, *args, **kwargs):
         ttk.Frame.__init__(self, parent, *args, **kwargs)
+        self.selected_clips = {}  # Changed to a dictionary to store clip data
+        self.style = ttk.Style()
+        self.style.configure("TFrame", background="white")
+        self.style.configure("Selected.TFrame", background="#4a90e2")
+        self.style.configure("Clip.TLabel", background="white")
+        self.style.configure("Selected.Clip.TLabel", background="#4a90e2")
+
+        # Create canvas
         self.canvas = tk.Canvas(self)
         self.scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
         self.scrollable_frame = ttk.Frame(self.canvas)
@@ -21,7 +32,7 @@ class ScrollableClipFrame(ttk.Frame):
             lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all"))
         )
 
-        self.canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")  # Changed to "nw"
+        self.canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
         self.canvas.configure(yscrollcommand=self.scrollbar.set)
 
         self.canvas.pack(side="left", fill="both", expand=True)
@@ -49,24 +60,45 @@ class ScrollableClipFrame(ttk.Frame):
         self.canvas.yview_scroll(int(-1*(event.delta/120)), "units")
 
     def add_clip(self, clip):
-        frame = ttk.Frame(self.scrollable_frame, width=240, height=200)
+        frame = ttk.Frame(self.scrollable_frame, width=260, height=280, style="TFrame")
         frame.grid(row=self.current_row, column=self.current_column, padx=10, pady=10, sticky="nsew")
-        frame.grid_propagate(False)  # Prevent the frame from shrinking
+        frame.grid_propagate(False)
 
         # Load and display thumbnail
         response = requests.get(clip['thumbnailURL'])
         img = Image.open(BytesIO(response.content))
-        img = img.resize((220, 124), Image.LANCZOS)  # Resize thumbnail
+        img = img.resize((240, 135), Image.LANCZOS)  # Slightly larger thumbnail
         photo = ImageTk.PhotoImage(img)
-        thumbnail_label = ttk.Label(frame, image=photo)
+        thumbnail_label = ttk.Label(frame, image=photo, style="Clip.TLabel")
         thumbnail_label.image = photo  # Keep a reference
-        thumbnail_label.pack(pady=(0, 5))
+        thumbnail_label.pack(pady=(10, 5))
 
         # Display title
-        title_label = ttk.Label(frame, text=clip['title'], wraplength=220, justify="center")
+        title_label = ttk.Label(frame, text=clip['title'], wraplength=240, justify="center", style="Clip.TLabel")
         title_label.pack(fill="x", expand=True)
 
-        self.clip_frames.append(frame)
+        # Display date
+        created_at = datetime.fromisoformat(clip['createdAt'].rstrip('Z'))
+        date_str = created_at.strftime("%Y-%m-%d %H:%M")
+        date_label = ttk.Label(frame, text=f"Created: {date_str}", wraplength=240, justify="center", style="Clip.TLabel")
+        date_label.pack(fill="x")
+
+        # Display views
+        views_label = ttk.Label(frame, text=f"Views: {clip['viewCount']:,}", wraplength=240, justify="center", style="Clip.TLabel")
+        views_label.pack(fill="x")
+
+        # Set initial style based on whether the clip is in selected_clips
+        initial_style = "Selected.TFrame" if clip['id'] in self.selected_clips else "TFrame"
+        frame.configure(style=initial_style)
+
+        # Bind click event to the frame
+        frame.bind("<Button-1>", lambda event, c=clip, f=frame: self.toggle_clip_selection(c, f))
+        
+        # Make sure all child widgets also trigger the selection
+        for child in frame.winfo_children():
+            child.bind("<Button-1>", lambda event, c=clip, f=frame: self.toggle_clip_selection(c, f))
+
+        self.clip_frames.append((frame, clip['id']))
 
         # Update grid position
         self.current_column += 1
@@ -74,13 +106,45 @@ class ScrollableClipFrame(ttk.Frame):
             self.current_column = 0
             self.current_row += 1
 
+    def toggle_clip_selection(self, clip, frame):
+        if clip['id'] in self.selected_clips:
+            del self.selected_clips[clip['id']]
+            frame.configure(style="TFrame")
+            for child in frame.winfo_children():
+                if isinstance(child, ttk.Label):
+                    child.configure(style="Clip.TLabel")
+        else:
+            self.selected_clips[clip['id']] = clip
+            frame.configure(style="Selected.TFrame")
+            for child in frame.winfo_children():
+                if isinstance(child, ttk.Label):
+                    child.configure(style="Selected.Clip.TLabel")
+
+    def get_selected_clips(self):
+        print("Inside get_selected_clips")
+        print("self.selected_clips:", self.selected_clips)
+        return list(self.selected_clips.values())
+    
     def clear_clips(self):
-        for frame in self.clip_frames:
+        for frame, _ in self.clip_frames:
             frame.destroy()
         self.clip_frames = []
         self.current_row = 0
         self.current_column = 0
-
+        # Note: We're not clearing selected_clips here anymore
+        
+    def update_selection_display(self):
+        for frame, clip_id in self.clip_frames:
+            if clip_id in self.selected_clips:
+                frame.configure(style="Selected.TFrame")
+                for child in frame.winfo_children():
+                    if isinstance(child, ttk.Label):
+                        child.configure(style="Selected.Clip.TLabel")
+            else:
+                frame.configure(style="TFrame")
+                for child in frame.winfo_children():
+                    if isinstance(child, ttk.Label):
+                        child.configure(style="Clip.TLabel")
 
         
 clip_fetcher = None
@@ -222,6 +286,7 @@ def open_bulk_download_window(root, twitch_downloader):
     username_entry.pack(pady=5)
 
     ttk.Label(bulk_window, text="Time Period:").pack(pady=5)
+
     time_period = tk.StringVar(bulk_window)
     time_period.set("7d")  # default value
     time_options = ["24h","24h", "7d", "30d", "all"] #extra 24h added cause it works & im lazy
@@ -235,21 +300,77 @@ def open_bulk_download_window(root, twitch_downloader):
     page_label = ttk.Label(bulk_window, text="Page: 1")
     page_label.pack()
 
+
+    def download_selected_clips():
+        selected_clips = clip_frame.get_selected_clips()
+        print("Type of selected_clips:", type(selected_clips))
+        print("Content of selected_clips:", selected_clips)
+    
+        if not selected_clips:
+            messagebox.showwarning("No Selection", "Please select at least one clip to download.")
+            return
+        
+            # Ask user to select a download directory
+        download_dir = filedialog.askdirectory(title="Select Download Directory")
+        if not download_dir:
+            return  # User cancelled the folder selection
+
+        # Create a new window to show download progress
+        progress_window = tk.Toplevel(bulk_window)
+        progress_window.title("Download Progress")
+        progress_window.geometry("600x400")
+
+        progress_text = tk.Text(progress_window, wrap=tk.WORD)
+        progress_text.pack(expand=True, fill="both")
+
+        progress_bar = ttk.Progressbar(progress_window, mode='indeterminate')
+        progress_bar.pack(fill="x", padx=20, pady=10)
+
+        close_button = ttk.Button(progress_window, text="Close", command=progress_window.destroy)
+        close_button.pack(pady=10)
+        close_button.config(state="disabled")
+
+        # Store the original output_text and progress_bar
+        original_output_text = twitch_downloader.output_text
+        original_progress_bar = twitch_downloader.progress_bar
+
+        # Temporarily replace them with the new ones
+        twitch_downloader.output_text = progress_text
+        twitch_downloader.progress_bar = progress_bar
+
+        def download_thread():
+            try:
+                twitch_downloader.bulk_download_clips(selected_clips, download_dir,username_entry.get())
+                progress_window.after(0, lambda: progress_text.insert(tk.END, "All selected clips have been downloaded and processed.\n"))
+            except Exception as e:
+                error_message = f"An error occurred: {str(e)}\n"
+                progress_window.after(0, lambda: progress_text.insert(tk.END, error_message))
+            finally:
+                # Restore the original output_text and progress_bar
+                twitch_downloader.output_text = original_output_text
+                twitch_downloader.progress_bar = original_progress_bar
+                progress_window.after(0, lambda: close_button.config(state="normal"))
+
+
+        thread = threading.Thread(target=download_thread)
+        thread.start()
+
+    download_button = ttk.Button(bulk_window, text="Download Selected Clips", command=download_selected_clips)
+    download_button.pack(pady=10)
+
     def fetch_and_display_clips(page):
         username = username_entry.get()
         period = time_period.get()
         clip_fetcher = twitchtools.get_clip_fetcher(username, period)
         
         # Fetch clips for the desired page
-        clips = []
-        for _ in range(page):
-            new_clips = twitchtools.fetch_clips(clip_fetcher, limit=30)
-            if _ == page - 1:
-                clips = new_clips
+        clips = twitchtools.fetch_clips(clip_fetcher, limit=30, page=page)
         
         clip_frame.clear_clips()
         for clip in clips:
             clip_frame.add_clip(clip)
+        
+        clip_frame.update_selection_display()  # Update the display to show correct selections
         
         page_label.config(text=f"Page: {page}")
         page_var.set(page)
@@ -266,6 +387,8 @@ def open_bulk_download_window(root, twitch_downloader):
 
     def go_to_page(*args):
         fetch_and_display_clips(int(page_dropdown.get()))
+
+    
 
     fetch_button = ttk.Button(bulk_window, text="Fetch Clips", command=lambda: fetch_and_display_clips(1))
     fetch_button.pack(pady=10)

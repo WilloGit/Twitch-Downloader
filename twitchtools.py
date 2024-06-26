@@ -9,6 +9,7 @@ class ClipFetcher:
             'Client-ID': 'kd1unb4b3q4t58fwlpcbzcbnm76a8fp',
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
         }
+        self.cursor = ""
 
     def convert_time_period(self, period): 
         period_map = {
@@ -20,7 +21,10 @@ class ClipFetcher:
         return period_map.get(period, "LAST_WEEK")
 
 
-    def fetch_clips(self, limit=30):
+    def fetch_clips(self, limit=30, page=1):
+        if page > 1 and not self.cursor:
+            return []  # No more clips to fetch
+
         url = "https://gql.twitch.tv/gql"
         query = f"""
         query {{
@@ -70,9 +74,23 @@ class ClipFetcher:
         except (KeyError, IndexError) as e:
             print(f"Error parsing clip data: {e}")
             return []
+        
+        clips = data['data']['user']['clips']['edges']
+        if clips:
+            self.cursor = clips[-1]['cursor']
+        
+        return [clip['node'] for clip in clips]
 
 def get_clip_fetcher(username, time_period):
     return ClipFetcher(username, time_period)
 
-def fetch_clips(clip_fetcher, limit=30):
-    return clip_fetcher.fetch_clips(limit)
+
+def fetch_clips(clip_fetcher, limit=30, page=1):
+    clips = []
+    for _ in range(page):
+        new_clips = clip_fetcher.fetch_clips(limit)
+        if _ == page - 1:
+            clips = new_clips
+        if not new_clips:
+            break
+    return clips

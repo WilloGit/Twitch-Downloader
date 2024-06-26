@@ -1,5 +1,8 @@
 import subprocess
 import threading
+import os
+from queue import Queue
+import shutil
 import tkinter as tk
 from tkinter import filedialog, messagebox
 from utils import is_valid_time, format_time
@@ -16,6 +19,64 @@ class TwitchDownloader:
         self.bulk_download_clips_button = None
         self.output_text = None
         self.progress_bar = None
+
+
+    def bulk_download_clips(self, clips, download_dir,username):
+        for clip in clips:
+            self.download_and_process_clip(clip, download_dir,username)
+
+
+    def download_and_process_clip(self, clip, download_dir, username):
+        slug = clip['slug']
+        clip_id = f"https://www.twitch.tv/{username}/clip/{slug}"
+        clip_title = clip['title']
+        
+        safe_title = "".join([c for c in clip_title if c.isalpha() or c.isdigit() or c==' ']).rstrip()
+        
+        # Create a temporary directory for processing
+        temp_dir = os.path.join(download_dir, f"temp_{safe_title}")
+        os.makedirs(temp_dir, exist_ok=True)
+
+        try:
+            # Download clip
+            clip_output = os.path.join(temp_dir, f"{safe_title}_clip.mp4")
+            clip_command = f"TwitchDownloaderCLI.exe clipdownload --id {clip_id} -o \"{clip_output}\""
+            self.run_command(clip_command, f"Downloading Clip: {clip_title}")
+
+            # Download chat
+            chat_output = os.path.join(temp_dir, f"{safe_title}_chat.json")
+            chat_command = f"TwitchDownloaderCLI.exe chatdownload --id {clip_id} --embed-images -o \"{chat_output}\""
+            self.run_command(chat_command, f"Downloading Chat: {clip_title}")
+
+            # Render chat
+            render_output = os.path.join(temp_dir, f"{safe_title}_chat_render.mov")
+            render_command = [
+                "TwitchDownloaderCLI", "chatrender",
+                "-i", chat_output,
+                "-o", render_output,
+                "--chat-width", "350",
+                "--chat-height", "200",
+                "--framerate", "30",
+                "--background-color", "#8B2A2A2A",
+                "--output-args=-c:v prores_ks -pix_fmt argb \"{save_path}\""
+            ]
+            self.run_command_shelled(render_command, f"Rendering Chat: {clip_title}")
+
+            # Combine clip and chat
+            combined_output = os.path.join(download_dir, f"{safe_title}_combined.mp4")
+            combine_command = (
+                f"ffmpeg.exe -i \"{clip_output}\" -i \"{render_output}\" "
+                f"-filter_complex \"[1:v]scale=350:200[v1];[0:v][v1]overlay=W-w:H-h[vout]\" "
+                f"-map \"[vout]\" -map 0:a \"{combined_output}\""
+            )
+            self.run_command(combine_command, f"Combining Clip and Chat: {clip_title}")
+
+            self.output_text.insert(tk.END, f"Completed processing: {clip_title}\n\n")
+            self.output_text.see(tk.END)
+
+        finally:
+            # Clean up temporary directory
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
     def download_vod(self):
         vod_id = self.vod_id_entry.get()
@@ -99,6 +160,7 @@ class TwitchDownloader:
         thread.start()
 
     def render_with_chat(self):
+
         chat_output = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON files", "*.json")])
         if not chat_output:
             return
@@ -159,14 +221,6 @@ class TwitchDownloader:
 
         thread = threading.Thread(target=render_task)
         thread.start()
-
-    def bulk_download_clips(self, clip_links):
-        for link in clip_links:
-            # Extract clip ID from the link
-            clip_id = self.extract_clip_id(link)
-            # Download and render each clip
-            self.download_clip(clip_id)
-            self.render_with_chat(clip_id)
 
     def run_command(self, command, description):
         self.progress_bar.start()
