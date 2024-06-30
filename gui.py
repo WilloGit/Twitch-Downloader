@@ -10,6 +10,7 @@ from PIL import Image, ImageTk
 from io import BytesIO
 from datetime import datetime
 from tkinter import messagebox
+from downloader import TwitchDownloader
 
 
 class ScrollableClipFrame(ttk.Frame):
@@ -201,8 +202,146 @@ def create_clip_frame(root, twitch_downloader):
     # Adds button for bulk downloading clips
     twitch_downloader.bulk_download_clips_button = tk.Button(clip_frame, text="Bulk Download & Render", command=lambda: open_bulk_download_window(root, twitch_downloader))
     twitch_downloader.bulk_download_clips_button.grid(row=2, column=0, columnspan=2, padx=10, pady=5, sticky='ew')
-
     
+    settings_button = ttk.Button(root, text="Settings", command=lambda: open_settings_window(twitch_downloader))
+    settings_button.pack(pady=10)
+
+def open_settings_window(twitch_downloader):
+    settings_window = tk.Toplevel()
+    settings_window.title("Chat Overlay Settings")
+    settings_window.geometry("800x600")
+
+    # Basic Label
+    label = tk.Label(settings_window, text="Chat Overlay Settings")
+    label.pack(pady=20)
+
+    # Video frame (16:9 aspect ratio)
+    video_frame = tk.Frame(settings_window, width=720, height=405, bg="#2C2C2C")  # Dark gray
+    video_frame.pack(pady=10)
+    video_frame.pack_propagate(False)
+    
+    video_label = tk.Label(video_frame, text="Video Area", fg="white", bg="#2C2C2C")
+    video_label.place(relx=0.5, rely=0.5, anchor="center")
+    # Chat overlay (represented by a canvas)
+    chat_canvas = tk.Canvas(video_frame, width=200, height=300, bg="lightgray", highlightthickness=2, highlightbackground="black")
+    chat_canvas.place(x=500, y=20)
+    chat_canvas.create_rectangle(0, 0, 200, 300, fill="lightgray", outline="black")
+    chat_canvas.create_text(100, 150, text="Chat Overlay", fill="black")
+
+    # Resize handles
+    handle_size = 10
+    handles = []
+    for x, y in [(0, 0), (200, 0), (200, 300), (0, 300)]:
+        handle = tk.Canvas(chat_canvas, width=handle_size, height=handle_size, bg="blue", highlightthickness=0)
+        handle.place(x=x-handle_size//2, y=y-handle_size//2)
+        handles.append(handle)
+
+    # Add drag functionality to the chat overlay
+    def start_drag(event):
+        chat_canvas.startX = event.x
+        chat_canvas.startY = event.y
+
+    def drag(event):
+        x = chat_canvas.winfo_x() - chat_canvas.startX + event.x
+        y = chat_canvas.winfo_y() - chat_canvas.startY + event.y
+        x = max(0, min(x, video_frame.winfo_width() - chat_canvas.winfo_width()))
+        y = max(0, min(y, video_frame.winfo_height() - chat_canvas.winfo_height()))
+        chat_canvas.place(x=x, y=y)
+
+    chat_canvas.bind("<Button-1>", start_drag)
+    chat_canvas.bind("<B1-Motion>", drag)
+
+    # Add resize functionality
+    def start_resize(event):
+        handle = event.widget
+        handle.startX = event.x
+        handle.startY = event.y
+
+    def resize(event):
+        handle = event.widget
+        dx = event.x - handle.startX
+        dy = event.y - handle.startY
+        
+        x = chat_canvas.winfo_x()
+        y = chat_canvas.winfo_y()
+        width = chat_canvas.winfo_width()
+        height = chat_canvas.winfo_height()
+        
+        if handle == handles[0]:  # Top-left
+            new_x = max(0, min(x + dx, x + width - 50))
+            new_y = max(0, min(y + dy, y + height - 50))
+            new_width = max(50, min(width - dx, video_frame.winfo_width() - new_x))
+            new_height = max(50, min(height - dy, video_frame.winfo_height() - new_y))
+        elif handle == handles[1]:  # Top-right
+            new_x = x
+            new_y = max(0, min(y + dy, y + height - 50))
+            new_width = max(50, min(width + dx, video_frame.winfo_width() - x))
+            new_height = max(50, min(height - dy, video_frame.winfo_height() - new_y))
+        elif handle == handles[2]:  # Bottom-right
+            new_x = x
+            new_y = y
+            new_width = max(50, min(width + dx, video_frame.winfo_width() - x))
+            new_height = max(50, min(height + dy, video_frame.winfo_height() - y))
+        else:  # Bottom-left
+            new_x = max(0, min(x + dx, x + width - 50))
+            new_y = y
+            new_width = max(50, min(width - dx, video_frame.winfo_width() - new_x))
+            new_height = max(50, min(height + dy, video_frame.winfo_height() - y))
+        
+        chat_canvas.place(x=new_x, y=new_y)
+        chat_canvas.config(width=new_width, height=new_height)
+        
+        # Update handle positions
+        handles[0].place(x=-handle_size//2, y=-handle_size//2)
+        handles[1].place(x=new_width-handle_size//2, y=-handle_size//2)
+        handles[2].place(x=new_width-handle_size//2, y=new_height-handle_size//2)
+        handles[3].place(x=-handle_size//2, y=new_height-handle_size//2)
+        
+        # Redraw chat overlay
+        chat_canvas.delete("all")
+        chat_canvas.create_rectangle(0, 0, new_width, new_height, fill="lightgray", outline="black")
+        chat_canvas.create_text(new_width//2, new_height//2, text="Chat Overlay", fill="black")
+
+    for handle in handles:
+        handle.bind("<Button-1>", start_resize)
+        handle.bind("<B1-Motion>", resize)
+
+    # Save button
+    save_button = tk.Button(settings_window, text="Save Settings", command=lambda: save_settings(chat_canvas, video_frame, twitch_downloader, settings_window))
+    save_button.pack(pady=20)
+
+    def configure_widgets():
+        video_frame.config(width=720, height=405, bg="#2C2C2C")
+        video_label.config(fg="white", bg="#2C2C2C")
+        chat_canvas.config(bg="lightgray")
+        
+        # Print debug information
+        print(f"Video frame width: {video_frame.winfo_width()}")
+        print(f"Video frame height: {video_frame.winfo_height()}")
+        print(f"Video frame bg color: {video_frame.cget('bg')}")
+        print(f"Chat canvas width: {chat_canvas.winfo_width()}")
+        print(f"Chat canvas height: {chat_canvas.winfo_height()}")
+        print(f"Chat canvas bg color: {chat_canvas.cget('bg')}")
+
+    # Schedule the configuration to occur after the window is fully created
+    settings_window.after(100, configure_widgets)
+
+def save_settings(chat_canvas, video_frame, twitch_downloader, settings_window):
+    # Calculate relative positions
+    x = chat_canvas.winfo_x() / video_frame.winfo_width()
+    y = chat_canvas.winfo_y() / video_frame.winfo_height()
+    width = chat_canvas.winfo_width() / video_frame.winfo_width()
+    height = chat_canvas.winfo_height() / video_frame.winfo_height()
+    
+    # Save settings
+    settings = {
+        "chat_x": x,
+        "chat_y": y,
+        "chat_width": width,
+        "chat_height": height
+    }
+    twitch_downloader.set_chat_settings(settings)
+    settings_window.destroy()
 
 def create_progress_bar(root):
     progress_bar = ttk.Progressbar(root, mode='indeterminate')
@@ -299,23 +438,36 @@ def open_bulk_download_window(root, twitch_downloader):
     page_var = tk.IntVar(value=1)
     page_label = ttk.Label(bulk_window, text="Page: 1")
     page_label.pack()
+    simultaneous_frame = ttk.Frame(bulk_window)
+    simultaneous_frame.pack(pady=5)
+
+    ttk.Label(simultaneous_frame, text="Simultaneous Downloads:").pack(side="left")
+    simultaneous_var = tk.StringVar(value="3")
+    simultaneous_entry = ttk.Entry(simultaneous_frame, textvariable=simultaneous_var, width=5)
+    simultaneous_entry.pack(side="left", padx=5)
 
 
     def download_selected_clips():
         selected_clips = clip_frame.get_selected_clips()
-        print("Type of selected_clips:", type(selected_clips))
-        print("Content of selected_clips:", selected_clips)
-    
         if not selected_clips:
             messagebox.showwarning("No Selection", "Please select at least one clip to download.")
             return
         
-            # Ask user to select a download directory
+        try:
+            max_workers = int(simultaneous_var.get())
+            if max_workers < 1:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Invalid Input", "Please enter a valid number for simultaneous downloads.")
+            return
+
+        # Ask user to select a download directory
         download_dir = filedialog.askdirectory(title="Select Download Directory")
         if not download_dir:
             return  # User cancelled the folder selection
 
-        # Create a new window to show download progress
+        twitch_downloader.set_max_workers(max_workers)
+
         progress_window = tk.Toplevel(bulk_window)
         progress_window.title("Download Progress")
         progress_window.geometry("600x400")
@@ -339,8 +491,9 @@ def open_bulk_download_window(root, twitch_downloader):
         twitch_downloader.progress_bar = progress_bar
 
         def download_thread():
+            username = username_entry.get()
             try:
-                twitch_downloader.bulk_download_clips(selected_clips, download_dir,username_entry.get())
+                twitch_downloader.bulk_download_clips(selected_clips, download_dir, username)
                 progress_window.after(0, lambda: progress_text.insert(tk.END, "All selected clips have been downloaded and processed.\n"))
             except Exception as e:
                 error_message = f"An error occurred: {str(e)}\n"
@@ -350,7 +503,6 @@ def open_bulk_download_window(root, twitch_downloader):
                 twitch_downloader.output_text = original_output_text
                 twitch_downloader.progress_bar = original_progress_bar
                 progress_window.after(0, lambda: close_button.config(state="normal"))
-
 
         thread = threading.Thread(target=download_thread)
         thread.start()
