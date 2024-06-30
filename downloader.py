@@ -8,6 +8,12 @@ import shutil
 import tkinter as tk
 from tkinter import filedialog, messagebox
 from utils import is_valid_time, format_time
+import assemblyai as aai
+import re
+
+# Replace with your API key
+aai.settings.api_key = os.getenv("ASSEMBLY_API_KEY")
+
 
 class TwitchDownloader:
     def __init__(self, root, video_player=None):
@@ -70,6 +76,38 @@ class TwitchDownloader:
                     self.output_text.insert(tk.END, f"Error processing clip: {str(e)}\n")
                     self.output_text.see(tk.END)
 
+
+
+    def transcribe_audio(self, audio_file):
+        transcriber = aai.Transcriber()
+        transcript = transcriber.transcribe(audio_file)
+        
+        if transcript.status == aai.TranscriptStatus.error:
+            print(f"Transcription error: {transcript.error}")
+            return None
+        
+        swear_patterns = [
+            r'\bf[u\*]+ck',  # Matches fuck, f*ck, fuuuck, etc.
+            r'\bsh[i\*]+t',  # Matches shit, sh*t, shiit, etc.
+            r'\bd[a\*]+mn',  # Matches damn, d*mn, etc.
+            r'\bb[i\*]+tch',  # Matches bitch, b*tch, etc.
+            r'\ba[s\*]+',  # Matches ass, a*s, etc.
+            r'\bmotherfuck',  # Matches motherfucker, motherfucking, etc.
+            r'\bretard',  # Matches retard
+            r'\bcunt',  # Matches cunt
+        ]
+        swear_regex = re.compile('|'.join(swear_patterns), re.IGNORECASE)
+        swear_timestamps = []
+
+        for word in transcript.words:
+            if swear_regex.search(word.text):
+                swear_timestamps.append((word.text, word.start, word.end))
+        
+        return transcript, swear_timestamps
+
+
+
+
     def download_and_process_clip(self, clip, download_dir, username):
         slug = clip['slug']
         clip_id = f"https://clips.twitch.tv/{slug}"  # Changed this to use the correct clip URL format
@@ -81,13 +119,16 @@ class TwitchDownloader:
         os.makedirs(temp_dir, exist_ok=True)
 
         try:
-             # Download clip and chat
+            # Download clip and chat
             clip_output = self.download_clip(clip_id, temp_dir, safe_title)
             chat_output = self.download_chat(clip_id, temp_dir, safe_title)
 
+            # Transcribe audio and detect swear words
+            transcript, swear_timestamps = self.transcribe_audio(clip_output)
+
             # Submit render and combine tasks to the thread pool
             render_future = self.render_pool.submit(self.render_chat, chat_output, temp_dir, safe_title)
-            combine_future = self.render_pool.submit(self.wait_and_combine, render_future, clip_output, download_dir, safe_title, clip_title)
+            combine_future = self.render_pool.submit(self.wait_and_combine, render_future, clip_output, download_dir, safe_title, clip_title, swear_timestamps)
 
             # Wait for the combine task to complete
             combine_future.result()
@@ -167,6 +208,7 @@ class TwitchDownloader:
         self.run_command(clip_command, f"Downloading Clip: {safe_title}")
         return clip_output
     
+
     def download_chat(self, clip_id, temp_dir, safe_title):
         chat_output = os.path.join(temp_dir, f"{safe_title}_chat.json")
         chat_command = f"TwitchDownloaderCLI.exe chatdownload --id {clip_id} --embed-images -o \"{chat_output}\""
@@ -188,28 +230,45 @@ class TwitchDownloader:
         self.run_command_shelled(render_command, f"Rendering Chat: {safe_title}")
         return render_output
 
-    def wait_and_combine(self, render_future, clip_output, download_dir, safe_title, clip_title):
+    def wait_and_combine(self, render_future, clip_output, download_dir, safe_title, clip_title, swear_timestamps):
         render_output = render_future.result()
         combined_output = os.path.join(download_dir, f"{safe_title}_combined.mp4")
-        self.combine_clip_and_chat(clip_output, render_output, combined_output, clip_title)
+        self.combine_clip_and_chat(clip_output, render_output, combined_output, clip_title, swear_timestamps)
 
-    def combine_clip_and_chat(self, clip_output, render_output, combined_output, clip_title):
+    def combine_clip_and_chat(self, clip_output, render_output, combined_output, clip_title, swear_timestamps):
         x = int(self.chat_settings["chat_x"] * 1920)
         y = int(self.chat_settings["chat_y"] * 1080)
+        
+        # Generate mute filter for swear words
+        mute_filter = self.generate_mute_filter(swear_timestamps)
+        
         combine_command = (
             f"ffmpeg.exe -i \"{clip_output}\" -i \"{render_output}\" "
-            f"-filter_complex \"[1:v]scale={int(self.chat_settings['chat_width'] * 1920)}:{int(self.chat_settings['chat_height'] * 1080)}[v1];[0:v][v1]overlay={x}:{y}[vout]\" "
-            f"-map \"[vout]\" -map 0:a \"{combined_output}\""
+            f"-filter_complex \"[1:v]scale={int(self.chat_settings['chat_width'] * 1920)}:{int(self.chat_settings['chat_height'] * 1080)}[v1];"
+            f"[0:v][v1]overlay={x}:{y}[vout];"
+            f"{mute_filter}\" "
+            f"-map \"[vout]\" -map \"[aout]\" \"{combined_output}\""
         )
         with self.render_lock:
             self.run_command(combine_command, f"Combining Clip and Chat: {clip_title}")
+
+    def generate_mute_filter(self, timestamps):
+        if not timestamps:
+            return "[0:a]acopy[aout]"
+        
+        filter_parts = []
+        for _, start, end in timestamps:
+            start_sec = start / 1000
+            end_sec = end / 1000
+            filter_parts.append(f"volume=enable='between(t,{start_sec},{end_sec})':volume=0")
+        
+        return f"[0:a]{','.join(filter_parts)}[aout]"
 
     def shutdown(self):
         self.render_pool.shutdown(wait=True)
 
 
     def render_with_chat(self):
-
         chat_output = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON files", "*.json")])
         if not chat_output:
             return
@@ -278,7 +337,7 @@ class TwitchDownloader:
         try:
             result = subprocess.run(command, shell=True, capture_output=True, text=True)
             if result.returncode == 0:
-                self.output_text.insert(tk.END, "Completed Successfully\n")
+                self.output_text.insert(tk.END, f"Command '{command}' completed successfully\n")
             else:
                 self.output_text.insert(tk.END, f"Error: {result.stderr}\n")
         finally:
