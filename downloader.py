@@ -2,6 +2,7 @@ import subprocess
 import concurrent.futures
 import threading
 import os
+import json
 import queue
 from queue import Queue
 import shutil
@@ -10,7 +11,8 @@ from tkinter import filedialog, messagebox
 from utils import is_valid_time, format_time
 import assemblyai as aai
 import re
-
+import logging
+import traceback
 # Replace with your API key
 aai.settings.api_key = os.getenv("ASSEMBLY_API_KEY")
 
@@ -18,7 +20,9 @@ aai.settings.api_key = os.getenv("ASSEMBLY_API_KEY")
 class TwitchDownloader:
     def __init__(self, root, video_player=None):
         self.root = root
+        self.vod_url_entry = None
         self.video_player = video_player
+        self.timestamps_text = None
         self.vod_id_entry = None
         self.start_time_entry = None
         self.end_time_entry = None
@@ -27,26 +31,54 @@ class TwitchDownloader:
         self.bulk_download_clips_button = None
         self.output_text = None
         self.progress_bar = None
-        self.max_workers = 3  # Default number of simultaneous downloads
         self.processing_queue = Queue()
         self.render_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2)  # Adjust max_workers as needed
         self.render_lock = threading.Lock()
         self.processing_thread = None
-        self.chat_settings = {
-            "chat_x": 0.7,
-            "chat_y": 0.05,
-            "chat_width": 0.28,
-            "chat_height": 0.74
+        self.settings_file = "settings.json"
+        loaded_settings = self.load_settings()
+        self.chat_settings = loaded_settings["chat_settings"]
+        self.max_workers = loaded_settings["max_workers"]
+
+    def load_settings(self):
+        default_settings = {
+            "chat_settings": {
+                "chat_x": 0.7611111111111111,
+                "chat_y": 0.38765432098765434,
+                "chat_width": 0.2388888888888889,
+                "chat_height": 0.6123456790123457,
+                "font_size": 24,
+                "background_color": "40808080"
+            },
+            "max_workers": 3
         }
+        try:
+            with open(self.settings_file, "r") as f:
+                loaded_settings = json.load(f)
+            # Ensure all expected keys are present
+            for key in default_settings:
+                if key not in loaded_settings:
+                    loaded_settings[key] = default_settings[key]
+            return loaded_settings
+        except FileNotFoundError:
+            return default_settings
 
-
+    def save_settings(self):
+        settings = {
+            "chat_settings": self.chat_settings,
+            "max_workers": self.max_workers
+        }
+        with open(self.settings_file, "w") as f:
+            json.dump(settings, f, indent=4)
 
     def set_chat_settings(self, settings):
         self.chat_settings.update(settings)
-
+        self.save_settings()
 
     def set_max_workers(self, workers):
         self.max_workers = workers
+        self.save_settings()
+
 
     def bulk_download_clips(self, clips, download_dir, username):
         self.processing_queue = queue.Queue()
@@ -79,39 +111,177 @@ class TwitchDownloader:
 
 
     def transcribe_audio(self, audio_file):
-        transcriber = aai.Transcriber()
-        transcript = transcriber.transcribe(audio_file)
-        
-        if transcript.status == aai.TranscriptStatus.error:
-            print(f"Transcription error: {transcript.error}")
-            return None
-        
-        swear_patterns = [
-            r'\bf[u\*]+ck',  # Matches fuck, f*ck, fuuuck, etc.
-            r'\bsh[i\*]+t',  # Matches shit, sh*t, shiit, etc.
-            r'\bd[a\*]+mn',  # Matches damn, d*mn, etc.
-            r'\bb[i\*]+tch',  # Matches bitch, b*tch, etc.
-            r'\ba[s\*]+',  # Matches ass, a*s, etc.
-            r'\bmotherfuck',  # Matches motherfucker, motherfucking, etc.
-            r'\bretard',  # Matches retard
-            r'\bcunt',  # Matches cunt
+        try:
+            transcriber = aai.Transcriber()
+            transcript = transcriber.transcribe(audio_file)
+            
+            if transcript.status == aai.TranscriptStatus.error:
+                self.safe_output_text_insert(f"Transcription error: {transcript.error}\n")
+                return None, []
+            
+            swear_patterns = [
+                r'\bf[u\*]+ck',
+                r'\bsh[i\*]+t',
+                r'\bd[a\*]+mn',
+                r'\bb[i\*]+tch',
+                r'\ba[s\*]+',
+                r'\bmotherfuck',
+                r'\bretard(?:s|ed)?',
+                r'\bcunts?',
+                r'\bd[i\*]+ck',
+                r'\bp[e\*]+nis',
+            ]
+            swear_regex = re.compile('|'.join(swear_patterns), re.IGNORECASE)
+            swear_timestamps = []
+
+            for word in transcript.words:
+                if swear_regex.search(word.text):
+                    swear_timestamps.append((word.text, word.start, word.end))
+            
+            return transcript, swear_timestamps
+        except Exception as e:
+            self.safe_output_text_insert(f"Transcription failed: {str(e)}\n")
+            return None, []
+
+    def download_vod_segments(self, vod_url, timestamps, download_dir):
+        try:
+            logging.debug(f"Starting download_vod_segments with {len(timestamps)} timestamps")
+            self.processing_queue = queue.Queue()
+            for i, timestamp in enumerate(timestamps, 1):
+                self.processing_queue.put((i, timestamp, vod_url, download_dir))
+            
+            self.process_vod_segments_queue()
+        except Exception as e:
+            logging.error(f"Error in download_vod_segments: {str(e)}")
+            logging.error(traceback.format_exc())
+            self.safe_output_text_insert(f"Error starting VOD segment download: {str(e)}\n")
+            messagebox.showerror("Error", f"An error occurred while starting the download: {str(e)}")
+
+    def process_vod_segments_queue(self):
+        try:
+            logging.debug("Starting process_vod_segments_queue")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                futures = []
+                while not self.processing_queue.empty():
+                    try:
+                        segment_info = self.processing_queue.get(block=False)
+                        future = executor.submit(self.process_vod_segment, *segment_info)
+                        futures.append(future)
+                    except queue.Empty:
+                        break
+                
+                for future in concurrent.futures.as_completed(futures):
+                    try:
+                        future.result()  # This will raise any exceptions that occurred during processing
+                    except Exception as e:
+                        logging.error(f"Error processing segment: {str(e)}")
+                        logging.error(traceback.format_exc())
+                        self.safe_output_text_insert(f"Error processing segment: {str(e)}\n")
+
+            self.safe_output_text_insert("All VOD segments have been processed.\n")
+            messagebox.showinfo("Download Complete", "All VOD segments have been downloaded and processed.")
+        except Exception as e:
+            logging.error(f"Error in process_vod_segments_queue: {str(e)}")
+            logging.error(traceback.format_exc())
+            self.safe_output_text_insert(f"Error processing VOD segments: {str(e)}\n")
+            messagebox.showerror("Error", f"An error occurred while processing VOD segments: {str(e)}")
+
+
+    def process_vod_segment(self, i, timestamp, vod_url, download_dir):
+        temp_dir = None
+        try:
+            logging.debug(f"Processing segment {i}: {timestamp}")
+            start_time, end_time = timestamp.split('-')
+            temp_dir = os.path.join(download_dir, f"temp_segment_{i}")
+            os.makedirs(temp_dir, exist_ok=True)
+            
+            # Download video segment
+            output_file = os.path.join(temp_dir, f"segment_{i}.mp4")
+            self.download_vod_segment(vod_url, start_time, end_time, output_file)
+
+            # Download chat
+            chat_output = os.path.join(temp_dir, f"segment_{i}_chat.json")
+            self.download_vod_chat(vod_url, start_time, end_time, chat_output)
+
+            # Transcribe audio and detect swear words
+            transcript, swear_timestamps = self.transcribe_audio(output_file)
+
+            # Render chat
+            render_future = self.render_pool.submit(self.render_chat, chat_output, temp_dir, f"segment_{i}")
+            
+            # Combine video and chat, and mute swear words
+            combined_output = os.path.join(download_dir, f"segment_{i}_combined.mp4")
+            self.wait_and_combine_vod(render_future, output_file, combined_output, swear_timestamps)
+
+            self.safe_output_text_insert(f"Completed processing segment {i}\n")
+        except Exception as e:
+            logging.error(f"Error processing segment {i}: {str(e)}")
+            logging.error(traceback.format_exc())
+            self.safe_output_text_insert(f"Error processing segment {i}: {str(e)}\n")
+        finally:
+            # Clean up temporary directory
+            if temp_dir and os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+    def download_vod_segment(self, vod_url, start_time, end_time, output_file):
+        command = [
+            "TwitchDownloaderCLI.exe",
+            "videodownload",
+            "-u", vod_url,
+            "-o", output_file,
+            "-b", start_time,
+            "-e", end_time
+            ]
+        self.run_command(command, f"Downloading VOD segment ({start_time} to {end_time})")
+    def download_vod_chat(self, vod_url, start_time, end_time, chat_output):
+        command = [
+            "TwitchDownloaderCLI.exe",
+            "chatdownload",
+            "-u", vod_url,
+            "-o", chat_output,
+            "-b", start_time,
+            "-e", end_time
         ]
-        swear_regex = re.compile('|'.join(swear_patterns), re.IGNORECASE)
-        swear_timestamps = []
+        self.run_command(command, f"Downloading chat ({start_time} to {end_time})")
 
-        for word in transcript.words:
-            if swear_regex.search(word.text):
-                swear_timestamps.append((word.text, word.start, word.end))
+    def wait_and_combine_vod(self, render_future, video_file, combined_output, swear_timestamps):
+        render_output = render_future.result()
+        x = int(self.chat_settings["chat_x"] * 1920)
+        y = int(self.chat_settings["chat_y"] * 1080)
         
-        return transcript, swear_timestamps
+        # Generate mute filter for swear words
+        mute_filter = self.generate_mute_filter(swear_timestamps)
+        
+        combine_command = [
+            "ffmpeg",
+            "-i", video_file,
+            "-i", render_output,
+            "-filter_complex",
+            f"[1:v]scale={int(self.chat_settings['chat_width'] * 1920)}:{int(self.chat_settings['chat_height'] * 1080)}[chat];"
+            f"[0:v][chat]overlay={x}:{y}[v];"
+            f"{mute_filter}",
+            "-map", "[v]",
+            "-map", "[aout]",
+            combined_output
+        ]
+        self.run_command(combine_command, f"Combining video and chat")
 
 
-
+    def safe_progress_bar_start(self):
+        if self.progress_bar:
+            self.progress_bar.start()
+        else:
+            print("Warning: Progress bar not initialized")  # Or use logging.warning()
 
     def download_and_process_clip(self, clip, download_dir, username):
-        slug = clip['slug']
-        clip_id = f"https://clips.twitch.tv/{slug}"  # Changed this to use the correct clip URL format
-        clip_title = clip['title']
+        if 'slug' in clip:
+            slug = clip['slug']
+            clip_id = f"https://clips.twitch.tv/{slug}"
+            clip_title = clip['title']
+        else:
+            clip_id = clip['id']
+            clip_title = clip['title']
         
         safe_title = "".join([c for c in clip_title if c.isalpha() or c.isdigit() or c==' ']).rstrip()
         
@@ -134,73 +304,72 @@ class TwitchDownloader:
             combine_future.result()
 
             with self.render_lock:
-                self.output_text.insert(tk.END, f"Completed processing: {clip_title}\n\n")
-                self.output_text.see(tk.END)
+                self.safe_output_text_insert(f"Completed processing: {clip_title}\n\n")
 
         except Exception as e:
             with self.render_lock:
-                self.output_text.insert(tk.END, f"Error processing {clip_title}: {str(e)}\n\n")
-                self.output_text.see(tk.END)
+                self.safe_output_text_insert(f"Error processing {clip_title}: {str(e)}\n\n")
         finally:
             # Clean up temporary directory
             shutil.rmtree(temp_dir, ignore_errors=True)
+
     
-    def download_vod(self):
-        vod_id = self.vod_id_entry.get()
-        start_time = self.start_time_entry.get()
-        end_time = self.end_time_entry.get()
+    # def download_vod(self):
+    #     vod_id = self.vod_id_entry.get()
+    #     start_time = self.start_time_entry.get()
+    #     end_time = self.end_time_entry.get()
 
-        if not vod_id:
-            messagebox.showerror("Input Error", "Please enter a VOD ID.")
-            return
+    #     if not vod_id:
+    #         messagebox.showerror("Input Error", "Please enter a VOD ID.")
+    #         return
 
-        if start_time and not is_valid_time(start_time):
-            messagebox.showerror("Input Error", "Start time must be in HHMMSS format.")
-            return
+    #     if start_time and not is_valid_time(start_time):
+    #         messagebox.showerror("Input Error", "Start time must be in HHMMSS format.")
+    #         return
 
-        if end_time and not is_valid_time(end_time):
-            messagebox.showerror("Input Error", "End time must be in HHMMSS format.")
-            return
+    #     if end_time and not is_valid_time(end_time):
+    #         messagebox.showerror("Input Error", "End time must be in HHMMSS format.")
+    #         return
 
-        vod_output = filedialog.asksaveasfilename(defaultextension=".mp4", filetypes=[("MP4 files", "*.mp4")])
-        if not vod_output:
-            return
+    #     vod_output = filedialog.asksaveasfilename(defaultextension=".mp4", filetypes=[("MP4 files", "*.mp4")])
+    #     if not vod_output:
+    #         return
 
-        vod_command = f"TwitchDownloaderCLI.exe videodownload --id {vod_id} -o \"{vod_output}\""
-        if start_time:
-            vod_command += f" -b {format_time(start_time)}"
-        if end_time:
-            vod_command += f" -e {format_time(end_time)}"
+    #     vod_command = f"TwitchDownloaderCLI.exe videodownload --id {vod_id} -o \"{vod_output}\""
+    #     if start_time:
+    #         vod_command += f" -b {format_time(start_time)}"
+    #     if end_time:
+    #         vod_command += f" -e {format_time(end_time)}"
 
-        chat_output = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON files", "*.json")])
-        if not chat_output:
-            return
+    #     chat_output = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON files", "*.json")])
+    #     if not chat_output:
+    #         return
 
-        chat_command = f"TwitchDownloaderCLI.exe chatdownload --id {vod_id} --embed-images -o \"{chat_output}\""
-        if start_time:
-            chat_command += f" -b {format_time(start_time)}"
-        if end_time:
-            chat_command += f" -e {format_time(end_time)}"
+    #     chat_command = f"TwitchDownloaderCLI.exe chatdownload --id {vod_id} --embed-images -o \"{chat_output}\""
+    #     if start_time:
+    #         chat_command += f" -b {format_time(start_time)}"
+    #     if end_time:
+    #         chat_command += f" -e {format_time(end_time)}"
 
-        render_output = filedialog.asksaveasfilename(defaultextension=".mp4", filetypes=[("MP4 files", "*.mp4")])
-        if not render_output:
-            return
+    #     render_output = filedialog.asksaveasfilename(defaultextension=".mp4", filetypes=[("MP4 files", "*.mp4")])
+    #     if not render_output:
+    #         return
 
-        render_command = f"TwitchDownloaderCLI.exe chatrender -i \"{chat_output}\" -o \"{render_output}\" --chat-width 350 --chat-height 200 --framerate 30"
-        combine_output = filedialog.asksaveasfilename(defaultextension=".mp4", filetypes=[("MP4 files", "*.mp4")])
-        if not combine_output:
-            return
+    #     render_command = f"TwitchDownloaderCLI.exe chatrender -i \"{chat_output}\" -o \"{render_output}\" --chat-width 350 --chat-height 200 --framerate 30"
+    #     combine_output = filedialog.asksaveasfilename(defaultextension=".mp4", filetypes=[("MP4 files", "*.mp4")])
+    #     if not combine_output:
+    #         return
 
-        combine_command = f"ffmpeg.exe -i \"{vod_output}\" -i \"{render_output}\" -filter_complex \"[1:v]scale=350:200[v1];[0:v][v1] overlay=W-w:H-h\" -codec:a copy \"{combine_output}\""
+    #     combine_command = f"ffmpeg.exe -i \"{vod_output}\" -i \"{render_output}\" -filter_complex \"[1:v]scale=350:200[v1];[0:v][v1] overlay=W-w:H-h\" -codec:a copy \"{combine_output}\""
 
-        def task():
-            self.run_command(vod_command, "Downloading VOD...")
-            self.run_command(chat_command, "Downloading Chat...")
-            self.run_command(render_command, "Rendering Chat...")
-            self.run_command(combine_command, "Combining VOD and Chat...")
+    #     def task():
+    #         self.run_command(vod_command, "Downloading VOD...")
+    #         self.run_command(chat_command, "Downloading Chat...")
+    #         self.run_command(render_command, "Rendering Chat...")
+    #         self.run_command(combine_command, "Combining VOD and Chat...")
 
-        thread = threading.Thread(target=task)
-        thread.start()
+    #     thread = threading.Thread(target=task)
+    #     thread.start()
 
     def download_clip(self, clip_id, temp_dir, safe_title):
         clip_output = os.path.join(temp_dir, f"{safe_title}_clip.mp4")
@@ -221,10 +390,11 @@ class TwitchDownloader:
             "TwitchDownloaderCLI", "chatrender",
             "-i", chat_output,
             "-o", render_output,
+            "-f", str(int(self.chat_settings["font_size"])),
             "--chat-width", str(int(self.chat_settings["chat_width"] * 1920)),
             "--chat-height", str(int(self.chat_settings["chat_height"] * 1080)),
             "--framerate", "12",
-            "--background-color", "#00000000",
+            "--background-color", "#"+str(self.chat_settings["background_color"]),
             "--output-args=-c:v prores_ks -pix_fmt argb \"{save_path}\""
         ]
         self.run_command_shelled(render_command, f"Rendering Chat: {safe_title}")
@@ -268,82 +438,102 @@ class TwitchDownloader:
         self.render_pool.shutdown(wait=True)
 
 
-    def render_with_chat(self):
-        chat_output = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON files", "*.json")])
-        if not chat_output:
-            return
+    # def render_with_chat(self):
+    #     chat_output = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON files", "*.json")])
+    #     if not chat_output:
+    #         return
 
-        chat_command = f"TwitchDownloaderCLI.exe chatdownload --id {clip_id} --embed-images -o \"{chat_output}\""
+    #     chat_command = f"TwitchDownloaderCLI.exe chatdownload --id {clip_id} --embed-images -o \"{chat_output}\""
 
-        render_output = filedialog.asksaveasfilename(
-            defaultextension=".mov", 
-            filetypes=[("MOV files", "*.mov")]
-        )
-        if not render_output:
-            return
+    #     render_output = filedialog.asksaveasfilename(
+    #         defaultextension=".mov", 
+    #         filetypes=[("MOV files", "*.mov")]
+    #     )
+    #     if not render_output:
+    #         return
 
-        render_command = [
-            "TwitchDownloaderCLI", "chatrender",
-            "-i", chat_output,
-            "-o", render_output,
-            "--chat-width", "350",
-            "--chat-height", "200",
-            "--framerate", "30",
-            "--background-color", "#8B2A2A2A",
-            "--output-args=-c:v prores_ks -pix_fmt argb \"{save_path}\""
-        ]
+    #     render_command = [
+    #         "TwitchDownloaderCLI", "chatrender",
+    #         "-i", chat_output,
+    #         "-o", render_output,
+    #         "--chat-width", "350",
+    #         "--chat-height", "200",
+    #         "--framerate", "30",
+    #         "--background-color", "#8B2A2A2A",
+    #         "--output-args=-c:v prores_ks -pix_fmt argb \"{save_path}\""
+    #     ]
 
-        combine_output = filedialog.asksaveasfilename(defaultextension=".mp4", filetypes=[("MP4 files", "*.mp4")])
-        if not combine_output:
-            return
+    #     combine_output = filedialog.asksaveasfilename(defaultextension=".mp4", filetypes=[("MP4 files", "*.mp4")])
+    #     if not combine_output:
+    #         return
 
-        def generate_mute_filter(segments):
-            if not segments:
-                return None
-            filter_parts = []
-            for start_ms, end_ms in segments:
-                start_sec = start_ms / 1000
-                end_sec = end_ms / 1000
-                filter_parts.append(f"volume=enable='between(t,{start_sec},{end_sec})':volume=0")
-            return ",".join(filter_parts)
+    #     def generate_mute_filter(segments):
+    #         if not segments:
+    #             return None
+    #         filter_parts = []
+    #         for start_ms, end_ms in segments:
+    #             start_sec = start_ms / 1000
+    #             end_sec = end_ms / 1000
+    #             filter_parts.append(f"volume=enable='between(t,{start_sec},{end_sec})':volume=0")
+    #         return ",".join(filter_parts)
         
-        mute_filter = generate_mute_filter(self.video_player.timestamps)
+    #     mute_filter = generate_mute_filter(self.video_player.timestamps)
 
-        filter_complex = "[1:v]scale=350:200[v1];[0:v][v1]overlay=W-w:H-h[vout]"
-        if mute_filter:
-            filter_complex += f";[0:a]{mute_filter}[aout]"
-            audio_map = "-map \"[aout]\""
+    #     filter_complex = "[1:v]scale=350:200[v1];[0:v][v1]overlay=W-w:H-h[vout]"
+    #     if mute_filter:
+    #         filter_complex += f";[0:a]{mute_filter}[aout]"
+    #         audio_map = "-map \"[aout]\""
+    #     else:
+    #         audio_map = "-map 0:a"
+
+    #     combine_command = (
+    #         f"ffmpeg.exe -i \"{clip_output}\" -i \"{render_output}\" "
+    #         f"-filter_complex \"{filter_complex}\" "
+    #         f"-map \"[vout]\" {audio_map} \"{combine_output}\""
+    #     )
+
+    #     def render_task():
+    #         self.run_command(chat_command, "Downloading Chat...")
+    #         self.run_command_shelled(render_command, "Rendering Chat...")
+    #         self.run_command(combine_command, "Combining Clip and Chat...")
+
+    #     thread = threading.Thread(target=render_task)
+    #     thread.start()
+
+
+    def safe_progress_bar_start(self):
+        if self.progress_bar:
+            self.progress_bar.start()
         else:
-            audio_map = "-map 0:a"
+            print("Warning: Progress bar not initialized")
 
-        combine_command = (
-            f"ffmpeg.exe -i \"{clip_output}\" -i \"{render_output}\" "
-            f"-filter_complex \"{filter_complex}\" "
-            f"-map \"[vout]\" {audio_map} \"{combine_output}\""
-        )
+    def safe_progress_bar_stop(self):
+        if self.progress_bar:
+            self.progress_bar.stop()
+        else:
+            print("Warning: Progress bar not initialized")
 
-        def render_task():
-            self.run_command(chat_command, "Downloading Chat...")
-            self.run_command_shelled(render_command, "Rendering Chat...")
-            self.run_command(combine_command, "Combining Clip and Chat...")
+    def safe_output_text_insert(self, message):
+        if self.output_text:
+            self.output_text.insert(tk.END, message)
+            self.output_text.see(tk.END)
+        else:
+            print(f"Output: {message}")
 
-        thread = threading.Thread(target=render_task)
-        thread.start()
+
 
     def run_command(self, command, description):
-        self.progress_bar.start()
-        self.output_text.insert(tk.END, f"{description}\n")
-        self.output_text.see(tk.END)
+        self.safe_progress_bar_start()
+        self.safe_output_text_insert(f"{description}\n")
         try:
-            result = subprocess.run(command, shell=True, capture_output=True, text=True)
-            if result.returncode == 0:
-                self.output_text.insert(tk.END, f"Command '{command}' completed successfully\n")
-            else:
-                self.output_text.insert(tk.END, f"Error: {result.stderr}\n")
+            result = subprocess.run(command, check=True, capture_output=True, text=True)
+            self.safe_output_text_insert("Command completed successfully\n")
+        except subprocess.CalledProcessError as e:
+            self.safe_output_text_insert(f"Error: {e.stderr}\n")
         finally:
-            self.progress_bar.stop()
-            self.output_text.insert(tk.END, "\n")
-            self.output_text.see(tk.END)
+            self.safe_progress_bar_stop()
+            self.safe_output_text_insert("\n")
+
 
     def run_command_shelled(self, command, description):
         self.progress_bar.start()

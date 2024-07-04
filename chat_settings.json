@@ -1,0 +1,11 @@
+{
+    "chat_settings": {
+        "chat_x": 0.7611111111111111,
+        "chat_y": 0.38765432098765434,
+        "chat_width": 0.2388888888888889,
+        "chat_height": 0.6123456790123457,
+        "font_size": 24,
+        "background_color": "#40808080"
+    },
+    "max_workers": 3
+}
