@@ -3,6 +3,7 @@ import concurrent.futures
 import threading
 import os
 import json
+import time
 import queue
 from queue import Queue
 import shutil
@@ -87,7 +88,16 @@ class TwitchDownloader:
         
         self.processing_thread = threading.Thread(target=self.process_queue)
         self.processing_thread.start()
-        self.processing_thread.join()  # Wait for the processing to complete
+        
+        # Wait for the processing to complete, but with a timeout
+        start_time = time.time()
+        while self.processing_thread.is_alive():
+            if time.time() - start_time > 3600:  # 1 hour timeout
+                self.safe_output_text_insert("Bulk download timed out after 1 hour\n")
+                break
+            time.sleep(1)
+        
+        self.safe_output_text_insert("Bulk download completed or timed out\n")
 
 
     def process_queue(self):
@@ -300,12 +310,14 @@ class TwitchDownloader:
             render_future = self.render_pool.submit(self.render_chat, chat_output, temp_dir, safe_title)
             combine_future = self.render_pool.submit(self.wait_and_combine, render_future, clip_output, download_dir, safe_title, clip_title, swear_timestamps)
 
-            # Wait for the combine task to complete
-            combine_future.result()
+            # Wait for the combine task to complete with a timeout
+            combine_future.result(timeout=600)  # 10 minutes timeout
 
             with self.render_lock:
                 self.safe_output_text_insert(f"Completed processing: {clip_title}\n\n")
-
+        except concurrent.futures.TimeoutError:
+            with self.render_lock:
+                self.safe_output_text_insert(f"Timeout while processing {clip_title}\n\n")
         except Exception as e:
             with self.render_lock:
                 self.safe_output_text_insert(f"Error processing {clip_title}: {str(e)}\n\n")
@@ -390,7 +402,7 @@ class TwitchDownloader:
             "TwitchDownloaderCLI", "chatrender",
             "-i", chat_output,
             "-o", render_output,
-            "-f", str(int(self.chat_settings["font_size"])),
+            "--font-size", str(int(self.chat_settings["font_size"])),
             "--chat-width", str(int(self.chat_settings["chat_width"] * 1920)),
             "--chat-height", str(int(self.chat_settings["chat_height"] * 1080)),
             "--framerate", "12",
@@ -401,15 +413,19 @@ class TwitchDownloader:
         return render_output
 
     def wait_and_combine(self, render_future, clip_output, download_dir, safe_title, clip_title, swear_timestamps):
-        render_output = render_future.result()
-        combined_output = os.path.join(download_dir, f"{safe_title}_combined.mp4")
-        self.combine_clip_and_chat(clip_output, render_output, combined_output, clip_title, swear_timestamps)
+        try:
+            render_output = render_future.result(timeout=300)  # 5 minutes timeout
+            combined_output = os.path.join(download_dir, f"{safe_title}_combined.mp4")
+            self.combine_clip_and_chat(clip_output, render_output, combined_output, clip_title, swear_timestamps)
+        except concurrent.futures.TimeoutError:
+            self.safe_output_text_insert(f"Timeout while waiting for chat render: {clip_title}\n")
+        except Exception as e:
+            self.safe_output_text_insert(f"Error in wait_and_combine for {clip_title}: {str(e)}\n")
 
     def combine_clip_and_chat(self, clip_output, render_output, combined_output, clip_title, swear_timestamps):
         x = int(self.chat_settings["chat_x"] * 1920)
         y = int(self.chat_settings["chat_y"] * 1080)
         
-        # Generate mute filter for swear words
         mute_filter = self.generate_mute_filter(swear_timestamps)
         
         combine_command = (
@@ -420,7 +436,21 @@ class TwitchDownloader:
             f"-map \"[vout]\" -map \"[aout]\" \"{combined_output}\""
         )
         with self.render_lock:
-            self.run_command(combine_command, f"Combining Clip and Chat: {clip_title}")
+            self.safe_output_text_insert(f"Starting to combine Clip and Chat: {clip_title}\n")
+            process = subprocess.Popen(combine_command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            
+            while True:
+                output = process.stderr.readline()
+                if output == '' and process.poll() is not None:
+                    break
+                if output:
+                    self.safe_output_text_insert(f"FFmpeg: {output.strip()}\n")
+            
+            rc = process.poll()
+            if rc == 0:
+                self.safe_output_text_insert(f"Successfully combined Clip and Chat: {clip_title}\n")
+            else:
+                self.safe_output_text_insert(f"Error combining Clip and Chat: {clip_title}. Return code: {rc}\n")
 
     def generate_mute_filter(self, timestamps):
         if not timestamps:
