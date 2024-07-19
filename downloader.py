@@ -79,7 +79,12 @@ class TwitchDownloader:
     def set_max_workers(self, workers):
         self.max_workers = workers
         self.save_settings()
+    #MIGHT BE REDUNDANT
+    def set_progress_bar(self, progress_bar):
+        self.progress_bar = progress_bar
 
+    def set_output_text(self, output_text):
+        self.output_text = output_text
 
     def bulk_download_clips(self, clips, download_dir, username):
         self.processing_queue = queue.Queue()
@@ -566,18 +571,25 @@ class TwitchDownloader:
 
 
     def run_command_shelled(self, command, description):
-        self.progress_bar.start()
-        self.output_text.insert(tk.END, f"{description}\n")
-        self.output_text.see(tk.END)
+        if self.progress_bar:
+            self.progress_bar.start()
+        if self.output_text:
+            self.output_text.insert(tk.END, f"{description}\n")
+            self.output_text.see(tk.END)
         try:
             result = subprocess.run(command, check=True, capture_output=True, text=True)
             if result.returncode == 0:
-                self.output_text.insert(tk.END, "Completed Successfully\n")
+                if self.output_text:
+                    self.output_text.insert(tk.END, "Completed Successfully\n")
             else:
-                self.output_text.insert(tk.END, f"Error: {result.stderr}\n")
+                if self.output_text:
+                    self.output_text.insert(tk.END, f"Error: {result.stderr}\n")
         except Exception as e:
-            self.output_text.insert(tk.END, f"Exception: {str(e)}\n")
+            if self.output_text:
+                self.output_text.insert(tk.END, f"Exception: {str(e)}\n")
         finally:
-            self.progress_bar.stop()
-            self.output_text.insert(tk.END, "\n")
-            self.output_text.see(tk.END)
+            if self.progress_bar:
+                self.progress_bar.stop()
+            if self.output_text:
+                self.output_text.insert(tk.END, "\n")
+                self.output_text.see(tk.END)

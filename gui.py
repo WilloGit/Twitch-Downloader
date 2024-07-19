@@ -177,13 +177,13 @@ def create_vod_frame(root, twitch_downloader):
     simultaneous_entry = ttk.Entry(vod_frame, textvariable=simultaneous_var, width=5)
     simultaneous_entry.grid(row=3, column=1, padx=5, pady=5, sticky="w")
 
-    download_btn = ttk.Button(vod_frame, text="Download VOD Segments", command=lambda: download_vod_segments(twitch_downloader, simultaneous_var))
+    download_btn = ttk.Button(vod_frame, text="Download VOD Segments", command=lambda: download_vod_segments(root, twitch_downloader, simultaneous_var))
     download_btn.grid(row=4, column=0, columnspan=2, padx=5, pady=10)
 
     vod_frame.columnconfigure(1, weight=1)
 
 
-def download_vod_segments(twitch_downloader, simultaneous_var):
+def download_vod_segments(root, twitch_downloader, simultaneous_var):
     vod_url = twitch_downloader.vod_url_entry.get().strip()
     timestamps = twitch_downloader.timestamps_text.get("1.0", tk.END).strip().split("\n")
     download_dir = filedialog.askdirectory(title="Select Download Directory")
@@ -200,9 +200,36 @@ def download_vod_segments(twitch_downloader, simultaneous_var):
         messagebox.showerror("Invalid Input", "Please enter a valid number for simultaneous downloads.")
         return
     twitch_downloader.set_max_workers(max_workers)
-    # Start the download process in a separate thread
-    threading.Thread(target=twitch_downloader.download_vod_segments, args=(vod_url, timestamps, download_dir), daemon=True).start()
+    progress_window = tk.Toplevel(root)
+    progress_window.title("Download Progress")
+    progress_window.geometry("600x400")
 
+    progress_text = tk.Text(progress_window, wrap=tk.WORD)
+    progress_text.pack(expand=True, fill="both")
+
+    progress_bar = ttk.Progressbar(progress_window, mode='indeterminate')
+    progress_bar.pack(fill="x", padx=20, pady=10)
+
+    close_button = ttk.Button(progress_window, text="Close", command=progress_window.destroy)
+    close_button.pack(pady=10)
+    close_button.config(state="disabled")
+
+    # Set the progress bar and output text for the twitch_downloader
+    twitch_downloader.set_progress_bar(progress_bar)
+    twitch_downloader.set_output_text(progress_text)
+
+    def download_thread():
+        try:
+            twitch_downloader.download_vod_segments(vod_url, timestamps, download_dir)
+            progress_window.after(0, lambda: progress_text.insert(tk.END, "All VOD segments have been downloaded and processed.\n"))
+        except Exception as e:
+            error_message = f"An error occurred: {str(e)}\n"
+            progress_window.after(0, lambda: progress_text.insert(tk.END, error_message))
+        finally:
+            progress_window.after(0, lambda: close_button.config(state="normal"))
+
+    thread = threading.Thread(target=download_thread)
+    thread.start()
 
 def create_clip_frame(root, twitch_downloader):
     # Creates a frame for the clip ID and download/render buttons
